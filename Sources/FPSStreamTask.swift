@@ -68,6 +68,17 @@ public class FileProviderStreamTask: URLSessionTask, StreamDelegate {
         return FileProviderStreamTask.streamTasks[_taskIdentifier]
     }
     
+    /// The end of the stream has been reached.
+    private var endEncountered: Bool = false
+    
+    /// Trust all certificates if `disableEvaluation`, Otherwise validate certificate chain.
+    public var serverTrustPolicy: ServerTrustPolicy = .performDefaultEvaluation(validateHost: true)
+    
+    /// A pointer to a buffer containing the peer ID data to set.
+    var peerID: UnsafeRawPointer? = nil
+    /// The length of the peer ID data buffer.
+    var peerIDLen: Int = 0
+    
     /**
      * An identifier uniquely identifies the task within a given session.
      *
@@ -414,6 +425,13 @@ public class FileProviderStreamTask: URLSessionTask, StreamDelegate {
         if isSecure {
             inputStream.setProperty(securityLevel.rawValue, forKey: .socketSecurityLevelKey)
             outputStream.setProperty(securityLevel.rawValue, forKey: .socketSecurityLevelKey)
+
+            if serverTrustPolicy.evaluate() {
+                // ※ Called, After setProperty securityLevel
+                addTrustAllCertificatesSettings()
+            }
+            
+            inputStream.setSSLPeerID(peerID: peerID, peerIDLen: peerIDLen)
         } else {
             inputStream.setProperty(StreamSocketSecurityLevel.none.rawValue, forKey: .socketSecurityLevelKey)
             outputStream.setProperty(StreamSocketSecurityLevel.none.rawValue, forKey: .socketSecurityLevelKey)
@@ -422,7 +440,11 @@ public class FileProviderStreamTask: URLSessionTask, StreamDelegate {
         inputStream.delegate = self
         outputStream.delegate = self
         
-        inputStream.schedule(in: RunLoop.main, forMode: .init("kCFRunLoopDefaultMode"))
+        #if swift(>=4.2)
+        inputStream.schedule(in: RunLoop.main, forMode: RunLoop.Mode.common)
+        #else
+        inputStream.schedule(in: RunLoop.main, forMode: RunLoop.Mode.commonModes)
+        #endif
         //outputStream.schedule(in: RunLoop.main, forMode: .init("kCFRunLoopDefaultMode"))
         
         inputStream.open()
@@ -463,7 +485,7 @@ public class FileProviderStreamTask: URLSessionTask, StreamDelegate {
         dispatch_queue.async {
             var timedOut: Bool = false
             self.dataReceivedLock.lock()
-            while (self.dataReceived.count == 0 || self.dataReceived.count < minBytes) && !timedOut {
+            while (self.dataReceived.count == 0 || self.dataReceived.count < minBytes) && !timedOut && !self.endEncountered {
                 self.dataReceivedLock.unlock()
                 Thread.sleep(forTimeInterval: 0.1)
                 if let error = inputStream.streamError {
@@ -473,6 +495,7 @@ public class FileProviderStreamTask: URLSessionTask, StreamDelegate {
                 timedOut = expireDate < Date()
                 self.dataReceivedLock.lock()
             }
+            self.endEncountered = false
             var dR: Data?
             if self.dataReceived.count > maxBytes {
                 let range: Range = 0..<maxBytes
@@ -486,7 +509,7 @@ public class FileProviderStreamTask: URLSessionTask, StreamDelegate {
             }
             let isEOF = inputStream.streamStatus == .atEnd && self.dataReceived.count == 0
             self.dataReceivedLock.unlock()
-            completionHandler(dR, isEOF, dR == nil ? inputStream.streamError : nil)
+            completionHandler(dR, isEOF, dR == nil ? (timedOut ? URLError(.timedOut) : inputStream.streamError) : nil)
         }
     }
     
@@ -514,10 +537,10 @@ public class FileProviderStreamTask: URLSessionTask, StreamDelegate {
         }
         
         guard outputStream != nil else {
+            if self.state == .canceling || self.state == .completed {
+                completionHandler(URLError(.cancelled))
+            }
             return
-        }
-        if data.count > 4096 {
-            isUploadTask = true
         }
         
         self.dataToBeSentLock.lock()
@@ -527,7 +550,8 @@ public class FileProviderStreamTask: URLSessionTask, StreamDelegate {
         dispatch_queue.async {
             let result = self.write(timeout: timeout, close: false)
             if result < 0 {
-                let error = self.outputStream?.streamError ?? URLError(.cannotWriteToFile)
+                let error = self.outputStream?.streamError ??
+                    URLError((self.state == .canceling || self.state == .completed) ? .cancelled : .cannotWriteToFile)
                 completionHandler(error)
             } else {
                 completionHandler(nil)
@@ -584,8 +608,6 @@ public class FileProviderStreamTask: URLSessionTask, StreamDelegate {
     
     fileprivate var shouldCloseWrite = false
     
-    fileprivate var isUploadTask = false
-    
     /**
      * Completes any enqueued reads and writes, and then closes the read side of the underlying socket.
      *
@@ -594,6 +616,19 @@ public class FileProviderStreamTask: URLSessionTask, StreamDelegate {
      * after calling this method will result in an error.
      */
     open func closeRead() {
+        closeRead(immediate: false)
+    }
+    
+    /**
+     * Completes any enqueued reads and writes, and then closes the read side of the underlying socket.
+     *
+     * You may continue to write data using the `write(_:timeout:completionHandler:)` method after
+     * calling this method. Any calls to `readData(ofMinLength:maxLength:timeout:completionHandler:)`
+     * after calling this method will result in an error.
+     *
+     * - Parameter immediate: close immediatly if true.
+     */
+    open func closeRead(immediate: Bool) {
         if #available(iOS 9.0, macOS 10.11, *) {
             if self.useURLSession {
                 _underlyingTask!.closeRead()
@@ -605,8 +640,10 @@ public class FileProviderStreamTask: URLSessionTask, StreamDelegate {
             return
         }
         dispatch_queue.async {
-            while inputStream.streamStatus != .atEnd {
-                Thread.sleep(forTimeInterval: 0.1)
+            if !immediate {
+                while inputStream.streamStatus != .atEnd {
+                    Thread.sleep(forTimeInterval: 0.1)
+                }
             }
             inputStream.close()
             self.streamDelegate?.urlSession?(self._underlyingSession, readClosedFor: self)
@@ -628,11 +665,29 @@ public class FileProviderStreamTask: URLSessionTask, StreamDelegate {
         }
         
         isSecure = true
-        dispatch_queue.async {
-            if let inputStream = self.inputStream, let outputStream = self.outputStream,
-                inputStream.property(forKey: .socketSecurityLevelKey) as? String == StreamSocketSecurityLevel.none.rawValue {
+        if let inputStream = self.inputStream, let outputStream = self.outputStream,
+            inputStream.property(forKey: .socketSecurityLevelKey) as? String == StreamSocketSecurityLevel.none.rawValue {
+            if serverTrustPolicy.evaluate() {
+                // ※ Called, Before setProperty securityLevel
+                self.addTrustAllCertificatesSettings()
+            }
+            
+            inputStream.setSSLPeerID(peerID: peerID, peerIDLen: peerIDLen)
+            
+            dispatch_queue.async {
                 inputStream.setProperty(self.securityLevel.rawValue, forKey: .socketSecurityLevelKey)
                 outputStream.setProperty(self.securityLevel.rawValue, forKey: .socketSecurityLevelKey)
+            }
+            
+            var sslSessionState: SSLSessionState = .idle
+            if let sslContext = inputStream.property(forKey: kCFStreamPropertySSLContext as Stream.PropertyKey) {
+                while SSLGetSessionState(sslContext as! SSLContext, UnsafeMutablePointer(&sslSessionState)) == errSSLWouldBlock ||
+                    sslSessionState == .idle || sslSessionState == .handshake {
+                        guard inputStream.streamError == nil, outputStream.streamError == nil else {
+                            break
+                        }
+                        Thread.sleep(forTimeInterval: 0.1)
+                }
             }
         }
     }
@@ -655,7 +710,81 @@ public class FileProviderStreamTask: URLSessionTask, StreamDelegate {
                 
                 inputStream.setProperty(StreamSocketSecurityLevel.none.rawValue, forKey: .socketSecurityLevelKey)
                 outputStream.setProperty(StreamSocketSecurityLevel.none.rawValue, forKey: .socketSecurityLevelKey)
+                
+                if let sslContext = inputStream.property(forKey: kCFStreamPropertySSLContext as Stream.PropertyKey) {
+                    while SSLClose(sslContext as! SSLContext) == errSSLWouldBlock {
+                        guard inputStream.streamError == nil || inputStream.streamError?._code == Int(errSSLClosedGraceful),
+                            outputStream.streamError == nil || outputStream.streamError?._code == Int(errSSLClosedGraceful) else {
+                                break
+                        }
+                        Thread.sleep(forTimeInterval: 0.1)
+                    }
+                }
             }
+        }
+    }
+    
+    /**
+     * Add TrustAllCertificates SSLSettings to Input/OutputStream.
+     *
+     * - note: Connects to a remote socket server using a self-signed certificate
+     */
+    func addTrustAllCertificatesSettings() {
+        // Define custom SSL/TLS settings
+        let sslSettings: [NSString: Any] = [
+            NSString(format: kCFStreamSSLValidatesCertificateChain): kCFBooleanFalse,
+            NSString(format: kCFStreamSSLPeerName): kCFNull
+        ]
+        // Set custom SSL/TLS settings
+        inputStream?.setProperty(sslSettings, forKey: kCFStreamPropertySSLSettings as Stream.PropertyKey)
+        outputStream?.setProperty(sslSettings, forKey: kCFStreamPropertySSLSettings as Stream.PropertyKey)
+    }
+    
+    /**
+     * Reuse SSL/TLS session used for the SSL/TLS session cache.
+     *
+     * - Parameter task: The task authenticated connection FTP over SSL/TLS.
+     */
+    func reuseSSLSession(task: FileProviderStreamTask) {
+        let sslPeerID = task.inputStream?.getSSLPeerID()
+        peerID = sslPeerID?.peerID
+        peerIDLen = sslPeerID?.peerIDLen ?? 0
+    }
+}
+
+extension Stream {
+    /**
+     * Retrieves the current peer ID data.
+     *
+     * - Returns:
+     *   - peerID: On return, points to a buffer containing the peer ID data.
+     *   - peerIDLen: On return, the length of the peer ID data buffer.
+     */
+    public func getSSLPeerID() -> (peerID: UnsafeRawPointer?, peerIDLen: Int) {
+        var peerID: UnsafeRawPointer? = nil
+        var peerIDLen: Int = 0
+        
+        if let sslContext = self.property(forKey: kCFStreamPropertySSLContext as Stream.PropertyKey) {
+            let _ = SSLGetPeerID(sslContext as! SSLContext, UnsafeMutablePointer(&peerID), UnsafeMutablePointer(&peerIDLen))
+        }
+        
+        return (peerID, peerIDLen)
+    }
+    
+    /**
+     * Specifies data that is sufficient to uniquely identify the peer of the current session.
+     * This peerID is used for the TLS session cache.
+     *
+     * - Parameter peerID: A pointer to a buffer containing the peer ID data to set.
+     * - Parameter peerIDLen: The length of the peer ID data buffer.
+     */
+    fileprivate func setSSLPeerID(peerID: UnsafeRawPointer?, peerIDLen: Int) {
+        guard peerID != nil, peerIDLen > 0 else {
+            return
+        }
+        
+        if let sslContext = self.property(forKey: kCFStreamPropertySSLContext as Stream.PropertyKey) {
+            let _ = SSLSetPeerID(sslContext as! SSLContext, peerID, peerIDLen)
         }
     }
 }
@@ -665,6 +794,10 @@ extension FileProviderStreamTask {
         if eventCode.contains(.errorOccurred) {
             self._error = aStream.streamError
             streamDelegate?.urlSession?(_underlyingSession, task: self, didCompleteWithError: error)
+        }
+        
+        if aStream == inputStream && eventCode.contains(.endEncountered) {
+            self.endEncountered = true
         }
         
         if aStream == inputStream && eventCode.contains(.hasBytesAvailable) {
@@ -717,6 +850,7 @@ extension FileProviderStreamTask {
         
         if close {
             DispatchQueue.main.sync {
+                outputStream.close()
                 shouldCloseWrite = true
             }
             self.streamDelegate?.urlSession?(self._underlyingSession, writeClosedFor: self)
@@ -725,20 +859,25 @@ extension FileProviderStreamTask {
     }
     
     fileprivate func finish() {
+        peerID = nil
+        
         inputStream?.delegate = nil
         outputStream?.delegate = nil
         
         inputStream?.close()
-        inputStream?.remove(from: RunLoop.main, forMode: .init("kCFRunLoopDefaultMode"))
+        #if swift(>=4.2)
+        inputStream?.remove(from: RunLoop.main, forMode: RunLoop.Mode.common)
+        #else
+        inputStream?.remove(from: RunLoop.main, forMode: RunLoop.Mode.commonModes)
+        #endif
         inputStream = nil
         
-        // TOFIX: This sleep is a workaround for truncated file uploading
-        if isUploadTask {
-            Thread.sleep(forTimeInterval: _underlyingSession.configuration.timeoutIntervalForRequest * 2)
-        }
-        
         outputStream?.close()
-        outputStream?.remove(from: RunLoop.main, forMode: .init("kCFRunLoopDefaultMode"))
+        #if swift(>=4.2)
+        outputStream?.remove(from: RunLoop.main, forMode: RunLoop.Mode.common)
+        #else
+        outputStream?.remove(from: RunLoop.main, forMode: RunLoop.Mode.commonModes)
+        #endif
         outputStream = nil
     }
     
