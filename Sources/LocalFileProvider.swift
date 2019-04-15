@@ -343,6 +343,10 @@ open class LocalFileProvider: NSObject, FileProvider, FileProviderMonitor, FileP
                     progress.setUserInfoObject(Progress.FileOperationKind.copying, forKey: .fileOperationKindKey)
                     guard let dest = dest else { return }
                     progress.totalUnitCount = abs(source.fileSize)
+                    if overwrite, ((try? dest.checkResourceIsReachable()) ?? false) ||
+                        ((try? dest.checkPromisedItemIsReachable()) ?? false) {
+                        try self.opFileManager.removeItem(at: dest)
+                    }
                     try self.opFileManager.moveItem(at: source, to: dest)
                 case.remove:
                     progress.totalUnitCount = abs(source.fileSize)
